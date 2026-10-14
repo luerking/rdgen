@@ -1,0 +1,13 @@
+# 保持 shell 脚本为 LF 行尾。
+# Windows 上克隆时 Git 默认会转成 CRLF，导致 Linux runner 上执行 bash 脚本
+# 报 `\r: command not found` 或 sed 行为异常。
+*.sh text eol=lf
+
+# 工作流与补丁同样必须是 LF（YAML/apply patch 对行尾敏感）
+*.yml text eol=lf
+*.yaml text eol=lf
+*.diff text eol=lf
+
+# Windows 批处理保持 CRLF
+*.bat text eol=crlf
+*.cmd text eol=crlf

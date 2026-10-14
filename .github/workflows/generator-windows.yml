@@ -485,6 +485,21 @@ jobs:
           sed -i -e 's#if is_local || peer_nat_type == NatType::SYMMETRIC {#if is_local || peer_nat_type == NatType::SYMMETRIC || !key.is_empty() {#' ./src/client.rs
           grep -n "key.is_empty()" ./src/client.rs || true
 
+      # 自建开源服务端专用：跳过 secure_tcp 握手
+      #
+      # 背景：RustDesk 1.4.1+ 在「key 与 API 登录 token 同时非空」时会发起
+      # secure_tcp 加密握手（src/client.rs 两处）。开源版 hbbs 没有 Pro 的配套
+      # 应答，静默不响应，客户端等满 READ_TIMEOUT(18s) 后中止，表现为登录后
+      # 一直卡「正在连接」或报 Failed to secure tcp。
+      # 不登录账号时 token 为空 → 不触发握手 → 故「不登录反而能用」。
+      #
+      # 本步骤把两处判定条件加上 false && 前缀，让握手永不执行。
+      # 代价：token 不再通过该握手加密保护，流量仍走自建 hbbs/hbbr。
+      - name: skip secure_tcp handshake (self-hosted OSS server)
+        shell: bash
+        run: |
+          bash ./.github/patches/patch-skip-secure-tcp.sh
+
       - name: use X for offline display instead of orange circle
         if: env.xOffline == 'true'
         uses: nick-fields/retry@v3

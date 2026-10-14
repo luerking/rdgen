@@ -487,11 +487,19 @@ jobs:
 
       # 自建开源服务端专用：跳过 secure_tcp 握手
       #
-      # 背景：RustDesk 1.4.1+ 在「key 与 API 登录 token 同时非空」时会发起
-      # secure_tcp 加密握手（src/client.rs 两处）。开源版 hbbs 没有 Pro 的配套
-      # 应答，静默不响应，客户端等满 READ_TIMEOUT(18s) 后中止，表现为登录后
-      # 一直卡「正在连接」或报 Failed to secure tcp。
+      # 背景：RustDesk 在「持有服务端 key 且持有 API 登录 token」时会发起
+      # secure_tcp 加密握手（src/client.rs）。开源版 hbbs 没有 Pro 的配套应答，
+      # 静默不响应，客户端等满 READ_TIMEOUT(18s) 后中止，表现为登录后一直卡
+      # 「正在连接」或报 Failed to secure tcp。
       # 不登录账号时 token 为空 → 不触发握手 → 故「不登录反而能用」。
+      #
+      # 版本差异（已逐一核对源码）：
+      #   <=1.4.x  两处：if !key.is_empty() && !token.is_empty() {
+      #   1.5.0    条件改为 legacy_secure 变量并新增 switch_code 分支：
+      #            let legacy_secure = !key.is_empty() && (!token.is_empty() || !switch_code.is_empty());
+      #            ... if !exchanged && legacy_secure { secure_tcp(...) }
+      #            另有 request_relay 的一处旧式条件。
+      #            故 1.5.0 用改写 legacy_secure 定义的方式，一处覆盖全部调用点。
       #
       # 注意：脚本逻辑直接内联，不引用仓库内文件。
       # 因为前面的「Checkout source code」用 actions/checkout 把 rustdesk/rustdesk
@@ -507,23 +515,68 @@ jobs:
           fi
 
           echo "=== before patch ==="
-          grep -n 'if !key.is_empty() && !token.is_empty() {' ./src/client.rs || true
+          grep -n 'secure_tcp' ./src/client.rs || true
 
-          # 给两处判定条件加 false && 前缀，让 secure_tcp 握手永不执行。
-          # 靠代码特征匹配（而非行号），跨 RustDesk 版本更耐漂移。
-          sed -i 's/if !key\.is_empty() && !token\.is_empty() {/if false \&\& !key.is_empty() \&\& !token.is_empty() {/g' ./src/client.rs
+          PATCHED=0
+
+          # ---- 1.5.0 及以后：改写 legacy_secure 定义，覆盖其下全部调用点 ----
+          if grep -q 'let legacy_secure = !key\.is_empty()' ./src/client.rs; then
+            echo ">>> detected 1.5.0+ style (legacy_secure)"
+            sed -i 's/let legacy_secure = !key\.is_empty() && (!token\.is_empty() || !switch_code\.is_empty());/let legacy_secure = false;/' ./src/client.rs
+            if grep -q 'let legacy_secure = false;' ./src/client.rs; then
+              echo "OK: legacy_secure forced to false"
+              PATCHED=$((PATCHED + 1))
+            else
+              echo "FAIL: could not rewrite legacy_secure definition"
+              exit 1
+            fi
+          elif grep -q 'let legacy_secure = false;' ./src/client.rs; then
+            echo ">>> 1.5.0+ style already patched"
+            PATCHED=$((PATCHED + 1))
+          fi
+
+          # ---- 1.5.0+ 的 request_relay：独立条件，不受 legacy_secure 保护 ----
+          # 该函数自带判定：if !key.is_empty() && (!token.is_empty() || !switch_code.is_empty()) {
+          # 与 legacy_secure 无继承关系，中继路径必须单独处理。
+          if grep -q 'if !key\.is_empty() && (!token\.is_empty() || !switch_code\.is_empty()) {' ./src/client.rs; then
+            echo ">>> detected request_relay style (1.5.0+)"
+            sed -i 's/if !key\.is_empty() && (!token\.is_empty() || !switch_code\.is_empty()) {/if false \&\& !key.is_empty() \&\& (!token.is_empty() || !switch_code.is_empty()) {/g' ./src/client.rs
+            H=$(grep -c 'if false && !key.is_empty() && (!token.is_empty() || !switch_code.is_empty()) {' ./src/client.rs || true)
+            echo "request_relay call sites patched: $H"
+            if [ "$H" -ge 1 ]; then
+              PATCHED=$((PATCHED + 1))
+            else
+              echo "FAIL: could not patch request_relay"
+              exit 1
+            fi
+          elif grep -q 'if false && !key.is_empty() && (!token.is_empty() || !switch_code.is_empty()) {' ./src/client.rs; then
+            echo ">>> request_relay style already patched"
+            PATCHED=$((PATCHED + 1))
+          fi
+
+          # ---- <=1.4.x：给旧式条件加 false && 前缀 ----
+          # 注意要排除「已打过补丁」的情形（幂等），否则重跑会误判为未匹配。
+          if grep -q 'if !key\.is_empty() && !token\.is_empty() {' ./src/client.rs; then
+            echo ">>> detected <=1.4.x style (inline condition)"
+            sed -i 's/if !key\.is_empty() && !token\.is_empty() {/if false \&\& !key.is_empty() \&\& !token.is_empty() {/g' ./src/client.rs
+            H=$(grep -c 'if false && !key.is_empty() && !token.is_empty() {' ./src/client.rs || true)
+            echo "inline call sites patched: $H"
+            if [ "$H" -ge 1 ]; then
+              PATCHED=$((PATCHED + 1))
+            fi
+          elif grep -q 'if false && !key.is_empty() && !token.is_empty() {' ./src/client.rs; then
+            echo ">>> <=1.4.x style already patched"
+            PATCHED=$((PATCHED + 1))
+          fi
 
           echo "=== after patch ==="
-          grep -n 'if false && !key.is_empty() && !token.is_empty() {' ./src/client.rs || true
+          grep -n 'secure_tcp\|legacy_secure = ' ./src/client.rs || true
 
-          HITS=$(grep -c 'if false && !key.is_empty() && !token.is_empty() {' ./src/client.rs || true)
-          echo "hits: $HITS"
-
-          if [ "$HITS" -eq 2 ]; then
-            echo "OK: secure_tcp disabled at 2 call sites"
+          if [ "$PATCHED" -ge 1 ]; then
+            echo "OK: secure_tcp disabled ($PATCHED style(s) handled)"
           else
-            echo "FAIL: expected 2 call sites, got $HITS"
-            echo "This RustDesk version may have changed. Check src/client.rs."
+            echo "FAIL: no known secure_tcp trigger pattern found."
+            echo "This RustDesk version may have restructured. Check src/client.rs."
             exit 1
           fi
 

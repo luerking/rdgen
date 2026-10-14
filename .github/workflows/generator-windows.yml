@@ -493,12 +493,39 @@ jobs:
       # 一直卡「正在连接」或报 Failed to secure tcp。
       # 不登录账号时 token 为空 → 不触发握手 → 故「不登录反而能用」。
       #
-      # 本步骤把两处判定条件加上 false && 前缀，让握手永不执行。
+      # 注意：脚本逻辑直接内联，不引用仓库内文件。
+      # 因为前面的「Checkout source code」用 actions/checkout 把 rustdesk/rustdesk
+      # 检出到工作区，会覆盖掉本仓库的 .github/ 目录，外部脚本文件会找不到。
+      #
       # 代价：token 不再通过该握手加密保护，流量仍走自建 hbbs/hbbr。
       - name: skip secure_tcp handshake (self-hosted OSS server)
         shell: bash
         run: |
-          bash ./.github/patches/patch-skip-secure-tcp.sh
+          if [ ! -f "./src/client.rs" ]; then
+            echo "ERROR: ./src/client.rs not found - checkout step did not run?"
+            exit 1
+          fi
+
+          echo "=== before patch ==="
+          grep -n 'if !key.is_empty() && !token.is_empty() {' ./src/client.rs || true
+
+          # 给两处判定条件加 false && 前缀，让 secure_tcp 握手永不执行。
+          # 靠代码特征匹配（而非行号），跨 RustDesk 版本更耐漂移。
+          sed -i 's/if !key\.is_empty() && !token\.is_empty() {/if false \&\& !key.is_empty() \&\& !token.is_empty() {/g' ./src/client.rs
+
+          echo "=== after patch ==="
+          grep -n 'if false && !key.is_empty() && !token.is_empty() {' ./src/client.rs || true
+
+          HITS=$(grep -c 'if false && !key.is_empty() && !token.is_empty() {' ./src/client.rs || true)
+          echo "hits: $HITS"
+
+          if [ "$HITS" -eq 2 ]; then
+            echo "OK: secure_tcp disabled at 2 call sites"
+          else
+            echo "FAIL: expected 2 call sites, got $HITS"
+            echo "This RustDesk version may have changed. Check src/client.rs."
+            exit 1
+          fi
 
       - name: use X for offline display instead of orange circle
         if: env.xOffline == 'true'

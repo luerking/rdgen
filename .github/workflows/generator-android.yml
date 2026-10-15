@@ -480,6 +480,93 @@ jobs:
           sed -i -e 's#if is_local || peer_nat_type == NatType::SYMMETRIC {#if is_local || peer_nat_type == NatType::SYMMETRIC || !key.is_empty() {#' ./src/client.rs
           grep -n "key.is_empty()" ./src/client.rs || true
 
+      # 自建开源服务端专用：跳过 secure_tcp 握手
+      #
+      # 与 generator-windows.yml 中的同名步骤逻辑一致。Android 客户端走
+      # 同一份 src/client.rs，因此触发点相同：持有服务端 key 且持有 API
+      # 登录 token 时会发起 secure_tcp，开源版 hbbs 无应答 → 客户端等满
+      # READ_TIMEOUT(18s) → 卡「正在连接」或报 Failed to secure tcp。
+      #
+      # 版本差异（已核对源码）：
+      #   <=1.4.x  两处内联条件 if !key.is_empty() && !token.is_empty() {
+      #   1.5.0    主路径改为 let legacy_secure = ... 变量并新增 switch_code
+      #            分支；request_relay 另有一份独立条件，需单独处理。
+      #
+      # 注意：Android runner 是 Linux，无需考虑 Windows 的 CRLF 与 shell 差异。
+      # 脚本逻辑内联，不引用仓库内文件（前面的 actions/checkout 会覆盖 .github/）。
+      #
+      # 代价：token 不再通过该握手加密保护，流量仍走自建 hbbs/hbbr。
+      - name: skip secure_tcp handshake (self-hosted OSS server)
+        shell: bash
+        run: |
+          if [ ! -f "./src/client.rs" ]; then
+            echo "ERROR: ./src/client.rs not found - checkout step did not run?"
+            exit 1
+          fi
+
+          echo "=== before patch ==="
+          grep -n 'secure_tcp' ./src/client.rs || true
+
+          PATCHED=0
+
+          # ---- 1.5.0+ 主路径：改写 legacy_secure 定义，覆盖其下全部调用点 ----
+          if grep -q 'let legacy_secure = !key\.is_empty()' ./src/client.rs; then
+            echo ">>> detected 1.5.0+ style (legacy_secure)"
+            sed -i 's/let legacy_secure = !key\.is_empty() && (!token\.is_empty() || !switch_code\.is_empty());/let legacy_secure = false;/' ./src/client.rs
+            if grep -q 'let legacy_secure = false;' ./src/client.rs; then
+              echo "OK: legacy_secure forced to false"
+              PATCHED=$((PATCHED + 1))
+            else
+              echo "FAIL: could not rewrite legacy_secure definition"
+              exit 1
+            fi
+          elif grep -q 'let legacy_secure = false;' ./src/client.rs; then
+            echo ">>> 1.5.0+ style already patched"
+            PATCHED=$((PATCHED + 1))
+          fi
+
+          # ---- 1.5.0+ 的 request_relay：独立条件，不受 legacy_secure 保护 ----
+          if grep -q 'if !key\.is_empty() && (!token\.is_empty() || !switch_code\.is_empty()) {' ./src/client.rs; then
+            echo ">>> detected request_relay style (1.5.0+)"
+            sed -i 's/if !key\.is_empty() && (!token\.is_empty() || !switch_code\.is_empty()) {/if false \&\& !key.is_empty() \&\& (!token.is_empty() || !switch_code.is_empty()) {/g' ./src/client.rs
+            H=$(grep -c 'if false && !key.is_empty() && (!token.is_empty() || !switch_code.is_empty()) {' ./src/client.rs || true)
+            echo "request_relay call sites patched: $H"
+            if [ "$H" -ge 1 ]; then
+              PATCHED=$((PATCHED + 1))
+            else
+              echo "FAIL: could not patch request_relay"
+              exit 1
+            fi
+          elif grep -q 'if false && !key.is_empty() && (!token.is_empty() || !switch_code.is_empty()) {' ./src/client.rs; then
+            echo ">>> request_relay style already patched"
+            PATCHED=$((PATCHED + 1))
+          fi
+
+          # ---- <=1.4.x：给旧式内联条件加 false && 前缀 ----
+          if grep -q 'if !key\.is_empty() && !token\.is_empty() {' ./src/client.rs; then
+            echo ">>> detected <=1.4.x style (inline condition)"
+            sed -i 's/if !key\.is_empty() && !token\.is_empty() {/if false \&\& !key.is_empty() \&\& !token.is_empty() {/g' ./src/client.rs
+            H=$(grep -c 'if false && !key.is_empty() && !token.is_empty() {' ./src/client.rs || true)
+            echo "inline call sites patched: $H"
+            if [ "$H" -ge 1 ]; then
+              PATCHED=$((PATCHED + 1))
+            fi
+          elif grep -q 'if false && !key.is_empty() && !token.is_empty() {' ./src/client.rs; then
+            echo ">>> <=1.4.x style already patched"
+            PATCHED=$((PATCHED + 1))
+          fi
+
+          echo "=== after patch ==="
+          grep -n 'secure_tcp\|legacy_secure = ' ./src/client.rs || true
+
+          if [ "$PATCHED" -ge 1 ]; then
+            echo "OK: secure_tcp disabled ($PATCHED style(s) handled)"
+          else
+            echo "FAIL: no known secure_tcp trigger pattern found."
+            echo "This RustDesk version may have restructured. Check src/client.rs."
+            exit 1
+          fi
+
       - name: use X for offline display instead of orange circle
         if: env.xOffline == 'true'
         uses: nick-fields/retry@v3

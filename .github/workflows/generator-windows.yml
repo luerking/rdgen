@@ -276,6 +276,124 @@ jobs:
           fi
           echo "OK: cleared $BEFORE rustdesk identifier(s)"
 
+      # 把 Cargo 包名与核心库名从 rustdesk / librustdesk 改成自定义标识
+      #
+      # 目的：消除二进制里的 crate 名（strings 或 panic 消息可提取），
+      # 以及安装目录里肉眼可见的 <name>.dll。
+      #
+      # 联动清单（必须成套改，漏一处即编译失败或运行时找不到 DLL）：
+      #   Cargo.toml  [package] name / default-run
+      #   Cargo.toml  [lib] name              → 产物 <id>.dll
+      #   Cargo.lock  根包 name               → cargo --locked 会校验，不改直接报错
+      #   build.py    hbb_name                → 找 target/release/<id>.exe
+      #   src/*.rs    use librustdesk::       → lib 名变了必须同步
+      #   flutter/... CMakeLists 的 RUSTDESK_LIB 与 RENAME
+      #   flutter/... main.cpp 的 LoadLibraryA
+      #   flutter/lib/models/native_model.dart → Linux .so 路径
+      #
+      # Rust crate 名只允许 ASCII 字母数字与 - _，含中文的 filename 会被清洗，
+      # 此时回退为 appcore。想让 dll 名与品牌一致，filename 请用英文。
+      - name: rename rust crate and core library
+        if: env.appname != 'rustdesk'
+        shell: bash
+        run: |
+          # run 默认带 -e -o pipefail，任何未命中的 grep 都会中断脚本，
+          # 因此下面的检索一律 || true。
+          set -o pipefail
+
+          RUSTID=$(printf '%s' "${{ env.filename }}" | tr -cd 'A-Za-z0-9_-' | tr 'A-Z' 'a-z')
+          [ -z "$RUSTID" ] && RUSTID="appcore"
+          case "$RUSTID" in
+            [0-9]*) RUSTID="app${RUSTID}" ;;
+          esac
+          case "$RUSTID" in
+            service|naming) RUSTID="${RUSTID}core" ;;
+          esac
+          AUTHOR="${{ env.compname }}"
+          [ -z "$AUTHOR" ] && AUTHOR="$RUSTID"
+
+          echo "crate id: $RUSTID"
+          echo "author  : $AUTHOR"
+
+          # 只检索实际存在的路径，避免 grep 因路径不存在返回 2
+          PATHS=""
+          for p in ./src ./libs ./flutter ./res ./Cargo.toml ./build.py; do
+            [ -e "$p" ] && PATHS="$PATHS $p"
+          done
+          echo "scan paths:$PATHS"
+
+          count_hits() {
+            grep -ro 'librustdesk' $PATHS 2>/dev/null | wc -l | tr -d ' ' || true
+          }
+
+          BEFORE=$(count_hits)
+          echo "librustdesk occurrences before: $BEFORE"
+          if [ "$BEFORE" = "0" ]; then
+            # 已改过（例如 workflow 重试）：只要包名不再是 rustdesk 就算完成。
+            # 不比对具体新名，避免冲突改名后重跑误判。
+            CUR=$(grep -m1 '^name = ' ./Cargo.toml 2>/dev/null | sed -n 's/^name = "\(.*\)"$/\1/p')
+            if [ -n "$CUR" ] && [ "$CUR" != "rustdesk" ]; then
+              echo "already renamed to '$CUR', nothing to do"
+              exit 0
+            fi
+            echo "FAIL: no librustdesk occurrences and package is still 'rustdesk'."
+            echo "      This RustDesk version may have restructured."
+            exit 1
+          fi
+
+          # 与 Cargo.lock 里的依赖包重名会让 cargo 报 two packages named ...
+          # 此时 lock 根包仍叫 rustdesk，故命中即为真正的依赖冲突。
+          if [ -f ./Cargo.lock ] && grep -qx "name = \"${RUSTID}\"" ./Cargo.lock 2>/dev/null; then
+            echo "crate id collides with an existing package, adding suffix"
+            RUSTID="${RUSTID}app"
+          fi
+
+          # lib 名（Cargo.toml 的 [lib] name、各处 use、dll/so 路径一并覆盖）
+          grep -rl 'librustdesk' $PATHS 2>/dev/null | while read -r f; do
+            sed -i "s|librustdesk|${RUSTID}|g" "$f"
+          done
+
+          # Cargo 包名、默认运行目标、作者
+          sed -i "s|^name = \"rustdesk\"\$|name = \"${RUSTID}\"|" ./Cargo.toml
+          sed -i "s|^default-run = \"rustdesk\"\$|default-run = \"${RUSTID}\"|" ./Cargo.toml
+          sed -i "s|^authors = \[\"rustdesk <info@rustdesk.com>\"\]\$|authors = [\"${AUTHOR}\"]|" ./Cargo.toml
+
+          # Cargo.lock 根包条目：不改会被 cargo --locked 拒绝
+          if [ -f ./Cargo.lock ]; then
+            sed -i "s|^name = \"rustdesk\"\$|name = \"${RUSTID}\"|" ./Cargo.lock
+          fi
+
+          # build.py 用它定位 target/release 下的主二进制
+          if [ -f ./build.py ]; then
+            sed -i "s|hbb_name = 'rustdesk' +|hbb_name = '${RUSTID}' +|" ./build.py
+          fi
+
+          echo "=== verify ==="
+          grep -m1 '^name = ' ./Cargo.toml || true
+          sed -n '/^\[lib\]/,/^\[/p' ./Cargo.toml | grep -m1 '^name = ' || true
+          grep -m1 '^default-run' ./Cargo.toml || true
+          grep -m1 '^authors' ./Cargo.toml || true
+          grep -m1 'hbb_name = ' ./build.py 2>/dev/null || true
+          grep -n 'LoadLibraryA' ./flutter/windows/main.cpp 2>/dev/null || true
+          grep -n 'RENAME' ./flutter/windows/CMakeLists.txt 2>/dev/null || true
+
+          LEFT=$(count_hits)
+          echo "librustdesk remaining: $LEFT"
+
+          if [ "$LEFT" != "0" ]; then
+            echo "FAIL: $LEFT librustdesk reference(s) remain"
+            exit 1
+          fi
+          if ! grep -q "LoadLibraryA(\"${RUSTID}.dll\")" ./flutter/windows/main.cpp 2>/dev/null; then
+            echo "FAIL: main.cpp does not load ${RUSTID}.dll"
+            exit 1
+          fi
+          if ! grep -qx "name = \"${RUSTID}\"" ./Cargo.toml 2>/dev/null; then
+            echo "FAIL: package name was not renamed"
+            exit 1
+          fi
+          echo "OK: crate and core library renamed to ${RUSTID}"
+
       - name: fix registry if appname has a space
         if: contains(env.appname, ' ')
         continue-on-error: true

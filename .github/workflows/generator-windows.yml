@@ -184,8 +184,11 @@ jobs:
           if [ ! -z "${{ env.compname }}" ]; then
             find ./src/lang -name "*.rs" -exec sed -i '/powered_by_me/s|RustDesk|${{ env.compname }}|g' {} \;
           fi
-          find ./src/lang -name "*.rs" -exec sed -i -e 's|RustDesk|${{ env.appname }}|' {} \;
-          sed -i -e 's|RustDesk|${{ env.appname }}|' ./res/msi/Package/License.rtf
+          find ./src/lang -name "*.rs" -exec sed -i -e 's|RustDesk|${{ env.appname }}|g' {} \;
+          # res/msi/Package/License.rtf 刻意不替换。
+          # 该文件是 AGPL-3.0 的许可声明，改写其中的版权人与项目名属于
+          # 篡改许可文本，AGPL §4 明确禁止。安装时显示原始许可声明即可，
+          # 这也让内部用户清楚产品来源。
 
       - name: fix registry if appname has a space
         if: contains(env.appname, ' ')
@@ -218,7 +221,6 @@ jobs:
           sed -i -e 's|Purslane Tech Pte. Ltd.|${{ env.compname }}|' ./flutter/windows/runner/Runner.rc
           sed -i -e 's|Purslane Tech Pte. Ltd.|${{ env.compname }}|' ./Cargo.toml
           sed -i -e 's|Purslane Tech Pte. Ltd.|${{ env.compname }}|' ./libs/portable/Cargo.toml
-          sed -i -e 's|Purslane Tech Pte. Ltd.|${{ env.compname }}|' ./res/msi/Package/License.rtf
           sed -i -e 's|Purslane Tech Pte. Ltd.|${{ env.compname }}|' ./src/main.rs
           sed -i -e 's|Purslane Ltd|${{ env.compname }}|' ./flutter/lib/desktop/pages/desktop_setting_page.dart
           sed -i -e 's|PURSLANE|${{ env.compname }}|' ./res/msi/preprocess.py
@@ -226,7 +228,6 @@ jobs:
           sed -i -e 's|Purslane Ltd|${{ env.compname }}|' ./flutter/windows/runner/Runner.rc
           sed -i -e 's|Purslane Ltd|${{ env.compname }}|' ./Cargo.toml
           sed -i -e 's|Purslane Ltd|${{ env.compname }}|' ./libs/portable/Cargo.toml
-          sed -i -e 's|Purslane Ltd|${{ env.compname }}|' ./res/msi/Package/License.rtf
           sed -i -e 's|Purslane Ltd|${{ env.compname }}|' ./src/main.rs
              
       - name: change url to custom
@@ -241,7 +242,6 @@ jobs:
           sed -i -e "s|const url = 'https://rustdesk.com/';|const url = '${{ env.urlLink }}';|" ./flutter/lib/mobile/pages/settings_page.dart
           sed -i -e "s|launchUrlString('https://rustdesk.com/privacy.html')|launchUrlString('${{ env.urlLink }}/privacy.html')|" ./flutter/lib/mobile/pages/settings_page.dart
           sed -i -e "s|https://rustdesk.com/privacy.html|${{ env.urlLink }}/privacy.html|" ./flutter/lib/desktop/pages/install_page.dart
-          sed -i -e "s|rustdesk.com|${{ env.urlLink }}|" ./res/msi/Package/License.rtf
 
       - name: change download link to custom
         if: env.downloadLink != 'https://rustdesk.com/download'

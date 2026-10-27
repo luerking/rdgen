@@ -190,6 +190,92 @@ jobs:
           # 篡改许可文本，AGPL §4 明确禁止。安装时显示原始许可声明即可，
           # 这也让内部用户清楚产品来源。
 
+      # 清理运行时会落到磁盘上的 rustdesk 硬编码名称
+      #
+      # 上面几步只改了版本资源与 UI 文案，但源码里还有几处字符串常量，
+      # 编译后会在运行时产生真实文件/进程，容易被用户或安全软件识别：
+      #   libs/portable/src/main.rs:324  RuntimeBroker_rustdesk.exe
+      #       每次启动都会把系统 RuntimeBroker.exe 复制到安装目录并改成该名，
+      #       伪装系统进程名却带 rustdesk 后缀，是杀软重点盯的行为。
+      #   libs/portable/src/main.rs:23   rustdesk-verified-
+      #       自动更新校验的临时文件前缀。
+      #   src/platform/windows.rs:2022   C:\ProgramData\RustDesk\RustDeskCustomClientStaging
+      #       公共目录，同机所有用户可见。
+      #   src/platform/windows.rs:1250   %LOCALAPPDATA%\rustdesk-sciter\rustdesk.exe
+      #       便携版服务登录助手路径。
+      #
+      # 用 filename 而不是 appname：这几处是文件名/进程名语义，filename 通常
+      # 不含空格，避免 taskkill /IM 与路径引用出问题。
+      #
+      # 风险说明：sciter 那两处属便携版服务登录助手，改动后路径仍由同一函数
+      # 生成，内部自洽；但属边缘路径，若后续发现服务登录异常，优先回看这里。
+      - name: remove residual rustdesk file and process names
+        if: env.appname != 'rustdesk'
+        shell: bash
+        run: |
+          NAME="${{ env.filename }}"
+          PORTABLE=./libs/portable/src/main.rs
+          WINPLAT=./src/platform/windows.rs
+
+          if [ ! -f "$PORTABLE" ] || [ ! -f "$WINPLAT" ]; then
+            echo "ERROR: source files missing - checkout step did not run?"
+            ls -l "$PORTABLE" "$WINPLAT" 2>/dev/null || true
+            exit 1
+          fi
+
+          # 统计目标出现次数（替换前），用于确认确实改到了东西。
+          # 只检查"替换后无残留"是不够的：源码结构一变，模式全部匹配不到，
+          # 替换后同样"无残留"，会静默放过。
+          count_hits() {
+            grep -o 'RuntimeBroker_rustdesk\.exe\|"rustdesk-verified-"\|"RustDeskCustomClientStaging"\|"rustdesk-sciter"' \
+              "$PORTABLE" "$WINPLAT" 2>/dev/null | wc -l | tr -d ' '
+          }
+
+          BEFORE=$(count_hits)
+          echo "matches before patch: $BEFORE"
+
+          # 已经是清理过的状态（例如 workflow 重试）：不算失败。
+          # 与"源码结构变化"的区别在于，后者连新名称也不存在。
+          count_new() {
+            grep -o "RuntimeBroker_${NAME}\.exe\|\"${NAME}-verified-\"\|\"${NAME}CustomClientStaging\"\|\"${NAME}-sciter\"" \
+              "$PORTABLE" "$WINPLAT" 2>/dev/null | wc -l | tr -d ' '
+          }
+
+          if [ "$BEFORE" -eq 0 ]; then
+            ALREADY=$(count_new)
+            if [ "$ALREADY" -gt 0 ]; then
+              echo "already patched ($ALREADY new-name match), nothing to do"
+              exit 0
+            fi
+            echo "FAIL: neither rustdesk names nor ${NAME} names were found."
+            echo "      This RustDesk version may have restructured the relevant files."
+            exit 1
+          fi
+
+          # RuntimeBroker_rustdesk.exe（定义 + taskkill 两处一并替换）
+          sed -i "s|RuntimeBroker_rustdesk\.exe|RuntimeBroker_${NAME}.exe|g" "$PORTABLE"
+          # 更新校验临时文件前缀
+          sed -i "s|\"rustdesk-verified-\"|\"${NAME}-verified-\"|" "$PORTABLE"
+          # 公共 staging 目录 C:\ProgramData\RustDesk\RustDeskCustomClientStaging
+          sed -i "s|\.join(\"RustDesk\")|.join(\"${NAME}\")|" "$WINPLAT"
+          sed -i "s|\.join(\"RustDeskCustomClientStaging\")|.join(\"${NAME}CustomClientStaging\")|" "$WINPLAT"
+          # 便携版服务登录助手 %LOCALAPPDATA%\rustdesk-sciter\rustdesk.exe
+          sed -i "s|\"rustdesk-sciter\"|\"${NAME}-sciter\"|" "$WINPLAT"
+          sed -i "s|dir\.join(\"rustdesk\.exe\")|dir.join(\"${NAME}.exe\")|" "$WINPLAT"
+
+          AFTER=$(count_hits)
+          echo "matches after patch: $AFTER"
+
+          echo "=== result ==="
+          grep -n "RuntimeBroker_${NAME}\|${NAME}-verified-\|${NAME}CustomClientStaging\|${NAME}-sciter\|join(\"${NAME}\")" \
+            "$PORTABLE" "$WINPLAT" || true
+
+          if [ "$AFTER" -ne 0 ]; then
+            echo "FAIL: $AFTER residual match(es) remain after patching."
+            exit 1
+          fi
+          echo "OK: cleared $BEFORE rustdesk identifier(s)"
+
       - name: fix registry if appname has a space
         if: contains(env.appname, ' ')
         continue-on-error: true
